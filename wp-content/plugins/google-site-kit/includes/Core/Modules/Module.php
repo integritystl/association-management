@@ -12,7 +12,9 @@ namespace Google\Site_Kit\Core\Modules;
 
 use Closure;
 use Google\Site_Kit\Context;
+use Google\Site_Kit\Core\Authentication\Clients\OAuth_Client;
 use Google\Site_Kit\Core\Authentication\Exception\Insufficient_Scopes_Exception;
+use Google\Site_Kit\Core\Authentication\Exception\Google_Proxy_Code_Exception;
 use Google\Site_Kit\Core\Contracts\WP_Errorable;
 use Google\Site_Kit\Core\Storage\Options;
 use Google\Site_Kit\Core\Storage\User_Options;
@@ -339,7 +341,14 @@ abstract class Module {
 			} catch ( Exception $e ) {
 				// Set every result of this batch to the exception.
 				foreach ( $results as $key => $definition_key ) {
-					$datapoint_service = ! empty( $datapoint_definitions[ $definition_key ] ) ? $datapoint_definitions[ $definition_key ]['service'] : null;
+					if ( is_wp_error( $definition_key ) ) {
+						continue;
+					}
+
+					$datapoint_service = ! empty( $datapoint_definitions[ $definition_key ] )
+						? $datapoint_definitions[ $definition_key ]['service']
+						: null;
+
 					if ( is_string( $definition_key ) && $service_identifier === $datapoint_service ) {
 						$results[ $key ] = $this->exception_to_error( $e, explode( ':', $definition_key, 2 )[1] );
 					}
@@ -554,29 +563,45 @@ abstract class Module {
 	 *
 	 * @since 1.0.0
 	 *
-	 * @param string $range      Date range string. Either 'last-7-days', 'last-14-days', 'last-90-days', or
-	 *                           'last-28-days' (default).
-	 * @param string $multiplier Optional. How many times the date range to get. This value can be specified if the
-	 *                           range should be request multiple times back. Default 1.
-	 * @param int    $offset     Days the range should be offset by. Default 1. Used by Search Console where
-	 *                           data is delayed by two days.
-	 * @param bool   $previous   Whether to select the previous period. Default false.
+	 * @param string $range         Date range string. Either 'last-7-days', 'last-14-days', 'last-90-days', or
+	 *                              'last-28-days' (default).
+	 * @param string $multiplier    Optional. How many times the date range to get. This value can be specified if the
+	 *                              range should be request multiple times back. Default 1.
+	 * @param int    $offset        Days the range should be offset by. Default 1. Used by Search Console where
+	 *                              data is delayed by two days.
+	 * @param bool   $previous      Whether to select the previous period. Default false.
+	 * @param bool   $weekday_align Whether to align the previous period days of the week to current period. Default false.
 	 *
 	 * @return array List with two elements, the first with the start date and the second with the end date, both as
 	 *               'Y-m-d'.
 	 */
-	protected function parse_date_range( $range, $multiplier = 1, $offset = 1, $previous = false ) {
-
+	protected function parse_date_range( $range, $multiplier = 1, $offset = 1, $previous = false, $weekday_align = false ) {
 		preg_match( '*-(\d+)-*', $range, $matches );
 		$number_of_days = $multiplier * ( isset( $matches[1] ) ? $matches[1] : 28 );
 
 		// Calculate the end date. For previous period requests, offset period by the number of days in the request.
-		$offset   = $previous ? $offset + $number_of_days : $offset;
-		$date_end = gmdate( 'Y-m-d', strtotime( $offset . ' days ago' ) );
+		$end_date_offset = $previous ? $offset + $number_of_days : $offset;
+		$date_end        = gmdate( 'Y-m-d', strtotime( $end_date_offset . ' days ago' ) );
 
 		// Set the start date.
-		$start_date_offset = $offset + $number_of_days - 1;
+		$start_date_offset = $end_date_offset + $number_of_days - 1;
 		$date_start        = gmdate( 'Y-m-d', strtotime( $start_date_offset . ' days ago' ) );
+
+		// When weekday_align is true and request is for a previous period,
+		// ensure the last & previous periods align by day of the week.
+		$date_end_day_of_week      = gmdate( 'w', strtotime( $date_end ) );
+		$previous_date_end_of_week = gmdate( 'w', strtotime( $offset . ' days ago' ) );
+		if ( $weekday_align && $previous && $date_end_day_of_week !== $previous_date_end_of_week ) {
+			// Adjust the date to closest period that matches the same days of the week.
+			$off_by = $number_of_days % 7;
+			if ( $off_by > 3 ) {
+				$off_by = $off_by - 7;
+			}
+
+			// Move the date to match the same day of the week.
+			$date_end   = gmdate( 'Y-m-d', strtotime( $off_by . ' days', strtotime( $date_end ) ) );
+			$date_start = gmdate( 'Y-m-d', strtotime( $off_by . ' days', strtotime( $date_start ) ) );
+		}
 
 		return array( $date_start, $date_end );
 	}
@@ -801,13 +826,10 @@ abstract class Module {
 
 		$code = $e->getCode();
 
-		$message = $e->getMessage();
-		$status  = is_numeric( $code ) && $code ? (int) $code : 500;
-		$reason  = '';
-
-		if ( empty( $code ) ) {
-			$code = 'unknown';
-		}
+		$message       = $e->getMessage();
+		$status        = is_numeric( $code ) && $code ? (int) $code : 500;
+		$reason        = '';
+		$reconnect_url = '';
 
 		if ( $e instanceof Google_Service_Exception ) {
 			$errors = $e->getErrors();
@@ -817,15 +839,67 @@ abstract class Module {
 			if ( isset( $errors[0]['reason'] ) ) {
 				$reason = $errors[0]['reason'];
 			}
+		} elseif ( $e instanceof Google_Proxy_Code_Exception ) {
+			$status        = 401;
+			$code          = $message;
+			$auth_client   = $this->authentication->get_oauth_client();
+			$message       = $auth_client->get_error_message( $code );
+			$reconnect_url = $auth_client->get_proxy_setup_url( $e->getAccessCode(), $code );
 		}
 
-		return new WP_Error(
-			$code,
-			$message,
-			array(
-				'status' => $status,
-				'reason' => $reason,
-			)
+		if ( empty( $code ) ) {
+			$code = 'unknown';
+		}
+
+		$data = array(
+			'status' => $status,
+			'reason' => $reason,
 		);
+
+		if ( ! empty( $reconnect_url ) ) {
+			$data['reconnectURL'] = $reconnect_url;
+		}
+
+		return new WP_Error( $code, $message, $data );
 	}
+
+	/**
+	 * Parses the string list into an array of strings.
+	 *
+	 * @since 1.15.0
+	 *
+	 * @param string|array $items Items to parse.
+	 * @return array An array of string items.
+	 */
+	protected function parse_string_list( $items ) {
+		if ( is_string( $items ) ) {
+			$items = explode( ',', $items );
+		}
+
+		if ( ! is_array( $items ) || empty( $items ) ) {
+			return array();
+		}
+
+		$items = array_map(
+			function( $item ) {
+				if ( ! is_string( $item ) ) {
+					return false;
+				}
+
+				$item = trim( $item );
+				if ( empty( $item ) ) {
+					return false;
+				}
+
+				return $item;
+			},
+			$items
+		);
+
+		$items = array_filter( $items );
+		$items = array_values( $items );
+
+		return $items;
+	}
+
 }

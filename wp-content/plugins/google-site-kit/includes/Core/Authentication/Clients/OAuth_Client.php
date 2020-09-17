@@ -14,8 +14,10 @@ use Exception;
 use Google\Site_Kit\Context;
 use Google\Site_Kit\Core\Authentication\Credentials;
 use Google\Site_Kit\Core\Authentication\Google_Proxy;
+use Google\Site_Kit\Core\Authentication\Owner_ID;
 use Google\Site_Kit\Core\Authentication\Profile;
 use Google\Site_Kit\Core\Authentication\Exception\Google_Proxy_Code_Exception;
+use Google\Site_Kit\Core\Permissions\Permissions;
 use Google\Site_Kit\Core\Storage\Encrypted_Options;
 use Google\Site_Kit\Core\Storage\Encrypted_User_Options;
 use Google\Site_Kit\Core\Storage\Options;
@@ -42,6 +44,7 @@ final class OAuth_Client {
 	const OPTION_ADDITIONAL_AUTH_SCOPES  = 'googlesitekit_additional_auth_scopes';
 	const OPTION_ERROR_CODE              = 'googlesitekit_error_code';
 	const OPTION_PROXY_ACCESS_CODE       = 'googlesitekit_proxy_access_code';
+	const CRON_REFRESH_PROFILE_DATA      = 'googlesitekit_cron_refresh_profile_data';
 
 	/**
 	 * Plugin context.
@@ -125,6 +128,14 @@ final class OAuth_Client {
 	private $http_proxy;
 
 	/**
+	 * Owner_ID instance.
+	 *
+	 * @since 1.16.0
+	 * @var Owner_ID
+	 */
+	private $owner_id;
+
+	/**
 	 * Access token for communication with Google APIs, for temporary storage.
 	 *
 	 * @since 1.0.0
@@ -179,6 +190,7 @@ final class OAuth_Client {
 		$this->google_proxy           = $google_proxy ?: new Google_Proxy( $this->context );
 		$this->profile                = $profile ?: new Profile( $this->user_options );
 		$this->http_proxy             = $http_proxy ?: new WP_HTTP_Proxy();
+		$this->owner_id               = new Owner_ID( $this->options );
 	}
 
 	/**
@@ -225,15 +237,9 @@ final class OAuth_Client {
 
 		// Configure the Google_Client's HTTP client to use to use the same HTTP proxy as WordPress HTTP, if set.
 		if ( $this->http_proxy->is_enabled() ) {
-			if ( $this->http_proxy->use_authentication() ) {
-				// The "Authorization" header is used to authenticate the end request; use the dedicated proxy header.
-				$http_client->setDefaultOption(
-					'headers/Proxy-Authorization',
-					'Basic ' . base64_encode( $this->http_proxy->authentication() )
-				);
-			}
-
-			$http_client->setDefaultOption( 'proxy', $this->http_proxy->host() . ':' . $this->http_proxy->port() );
+			// See http://docs.guzzlephp.org/en/5.3/clients.html#proxy for reference.
+			$auth = $this->http_proxy->use_authentication() ? "{$this->http_proxy->authentication()}@" : '';
+			$http_client->setDefaultOption( 'proxy', "{$auth}{$this->http_proxy->host()}:{$this->http_proxy->port()}" );
 			$ssl_verify = $http_client->getDefaultOption( 'verify' );
 			// Allow SSL verification to be filtered, as is often necessary with HTTP proxies.
 			$http_client->setDefaultOption(
@@ -633,7 +639,11 @@ final class OAuth_Client {
 		$scopes = array_merge( $this->get_required_scopes(), $additional_scopes );
 		$this->get_client()->setScopes( array_unique( $scopes ) );
 
-		return $this->get_client()->createAuthUrl();
+		$query_params = array(
+			'hl' => get_user_locale(),
+		);
+
+		return add_query_arg( $query_params, $this->get_client()->createAuthUrl() );
 	}
 
 	/**
@@ -709,7 +719,7 @@ final class OAuth_Client {
 		);
 		$this->set_granted_scopes( $scopes );
 
-		$this->refresh_profile_data();
+		$this->refresh_profile_data( 2 * MINUTE_IN_SECONDS );
 
 		// TODO: In the future, once the old authentication mechanism no longer exists, this check can be removed.
 		// For now the below action should only fire for the proxy despite not clarifying that in the hook name.
@@ -727,6 +737,13 @@ final class OAuth_Client {
 			 * @param array $token_response Token response data.
 			 */
 			do_action( 'googlesitekit_authorize_user', $token_response );
+		}
+
+		// This must happen after googlesitekit_authorize_user as the permissions checks depend on
+		// values set which affect the meta capability mapping.
+		$current_user_id = get_current_user_id();
+		if ( $this->should_update_owner_id( $current_user_id ) ) {
+			$this->owner_id->set( $current_user_id );
 		}
 
 		$redirect_url = $this->user_options->get( self::OPTION_REDIRECT_URL );
@@ -751,8 +768,11 @@ final class OAuth_Client {
 	 * Fetches and updates the user profile data for the currently authenticated Google account.
 	 *
 	 * @since 1.1.4
+	 * @since 1.13.0 Added $retry_after param, also made public.
+	 *
+	 * @param int $retry_after Optional. Number of seconds to retry data fetch if unsuccessful.
 	 */
-	private function refresh_profile_data() {
+	public function refresh_profile_data( $retry_after = 0 ) {
 		try {
 			$people_service = new Google_Service_PeopleService( $this->get_client() );
 			$response       = $people_service->people->get( 'people/me', array( 'personFields' => 'emailAddresses,photos' ) );
@@ -765,9 +785,21 @@ final class OAuth_Client {
 					)
 				);
 			}
-		} catch ( Exception $e ) { // phpcs:ignore Generic.CodeAnalysis.EmptyStatement.DetectedCatch
-			// This request is unlikely to fail and isn't critical as Site Kit will fallback to the current WP user
-			// if no Profile data exists. Don't do anything for now.
+			// Clear any scheduled job to refresh this data later, if any.
+			wp_clear_scheduled_hook(
+				self::CRON_REFRESH_PROFILE_DATA,
+				array( $this->user_options->get_user_id() )
+			);
+		} catch ( Exception $e ) {
+			$retry_after = absint( $retry_after );
+			if ( $retry_after < 1 ) {
+				return;
+			}
+			wp_schedule_single_event(
+				time() + $retry_after,
+				self::CRON_REFRESH_PROFILE_DATA,
+				array( $this->user_options->get_user_id() )
+			);
 		}
 	}
 
@@ -834,8 +866,34 @@ final class OAuth_Client {
 		$query_params = array_merge( $query_params, $user_fields );
 
 		$query_params['application_name'] = rawurlencode( $this->get_application_name() );
+		$query_params['hl']               = get_user_locale();
 
 		return add_query_arg( $query_params, $this->google_proxy->url( Google_Proxy::SETUP_URI ) );
+	}
+
+	/**
+	 * Determines whether the current owner ID must be changed or not.
+	 *
+	 * @since 1.16.0
+	 *
+	 * @param int $user_id Current user ID.
+	 * @return bool TRUE if owner needs to be changed, otherwise FALSE.
+	 */
+	private function should_update_owner_id( $user_id ) {
+		$current_owner_id = $this->owner_id->get();
+		if ( $current_owner_id === $user_id ) {
+			return false;
+		}
+
+		if ( ! empty( $current_owner_id ) && user_can( $current_owner_id, Permissions::MANAGE_OPTIONS ) ) {
+			return false;
+		}
+
+		if ( ! user_can( $user_id, Permissions::MANAGE_OPTIONS ) ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	/**
@@ -897,6 +955,7 @@ final class OAuth_Client {
 		}
 
 		$query_args['application_name'] = rawurlencode( $this->get_application_name() );
+		$query_args['hl']               = get_user_locale();
 
 		return add_query_arg( $query_args, $this->google_proxy->url( Google_Proxy::PERMISSIONS_URI ) );
 	}
@@ -922,25 +981,30 @@ final class OAuth_Client {
 	 */
 	public function get_error_message( $error_code ) {
 		switch ( $error_code ) {
+			case 'access_denied':
+				return __( 'The Site Kit setup was interrupted because you did not grant the necessary permissions.', 'google-site-kit' );
+			case 'access_token_not_received':
+				return __( 'Unable to receive access token because of an unknown error.', 'google-site-kit' );
+			case 'cannot_log_in':
+				return __( 'Internal error that the Google login redirect failed.', 'google-site-kit' );
+			case 'invalid_client':
+				return __( 'Unable to receive access token because of an invalid client.', 'google-site-kit' );
+			case 'invalid_code':
+				return __( 'Unable to receive access token because of an empty authorization code.', 'google-site-kit' );
+			case 'invalid_grant':
+				return __( 'Unable to receive access token because of an invalid authorization code or refresh token.', 'google-site-kit' );
+			case 'invalid_request':
+				return __( 'Unable to receive access token because of an invalid OAuth request.', 'google-site-kit' );
+			case 'missing_delegation_consent':
+				return __( 'Looks like your site is not allowed access to Google account data and can’t display stats in the dashboard.', 'google-site-kit' );
+			case 'missing_search_console_property':
+				return __( 'Looks like there is no Search Console property for your site.', 'google-site-kit' );
+			case 'missing_verification':
+				return __( 'Looks like the verification token for your site is missing.', 'google-site-kit' );
 			case 'oauth_credentials_not_exist':
 				return __( 'Unable to authenticate Site Kit, as no client credentials exist.', 'google-site-kit' );
 			case 'refresh_token_not_exist':
 				return __( 'Unable to refresh access token, as no refresh token exists.', 'google-site-kit' );
-			case 'cannot_log_in':
-				return __( 'Internal error that the Google login redirect failed.', 'google-site-kit' );
-			case 'invalid_code':
-				return __( 'Unable to receive access token because of an empty authorization code.', 'google-site-kit' );
-			case 'access_token_not_received':
-				return __( 'Unable to receive access token because of an unknown error.', 'google-site-kit' );
-			case 'access_denied':
-				return __( 'The Site Kit setup was interrupted because you did not grant the necessary permissions.', 'google-site-kit' );
-			// The following messages are based on https://tools.ietf.org/html/rfc6749#section-5.2.
-			case 'invalid_request':
-				return __( 'Unable to receive access token because of an invalid OAuth request.', 'google-site-kit' );
-			case 'invalid_client':
-				return __( 'Unable to receive access token because of an invalid client.', 'google-site-kit' );
-			case 'invalid_grant':
-				return __( 'Unable to receive access token because of an invalid authorization code or refresh token.', 'google-site-kit' );
 			case 'unauthorized_client':
 				return __( 'Unable to receive access token because of an unauthorized client.', 'google-site-kit' );
 			case 'unsupported_grant_type':
